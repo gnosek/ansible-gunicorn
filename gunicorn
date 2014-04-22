@@ -1,0 +1,117 @@
+#!/usr/bin/python
+
+import os
+import subprocess
+import signal
+import time
+
+# --- this is pure Python, unrelated to Ansible ---
+
+def gunicorn_getpid(pidfile):
+    try:
+        with open(pidfile) as f:
+            return int(f.read())
+    except (IOError, ValueError):
+        return
+
+def gunicorn_start(params):
+    if params['virtualenv']:
+        gunicorn = os.path.join(params['virtualenv'], 'bin/gunicorn')
+    else:
+        gunicorn = 'gunicorn'
+
+    command = [
+        gunicorn,
+        params['app'],
+        '-p', params['pidfile'],
+        '-b', params['port'],
+        '-D']
+
+    subprocess.check_call(command)
+
+def gunicorn_stop(pid):
+    os.kill(pid, signal.SIGTERM)
+
+# --- these are a few helper functions, gluing Ansible-specific and universal code
+
+def ensure_started(pid, params):
+    if pid is not None:
+        return dict(pid=pid, state='started', changed=False)
+    else:
+        gunicorn_start(params)
+        time.sleep(0.5)  # wait for the pidfile to appear
+        pid = gunicorn_getpid(params['pidfile'])
+        return dict(pid=pid, state='started', changed=True)
+
+def ensure_stopped(pid, params):
+    if pid is None:
+        return dict(state='stopped', changed=False)
+    else:
+        gunicorn_stop(pid)
+        return dict(state='stopped', changed=True)
+
+def restart(pid, params):
+    if pid is not None:
+        gunicorn_stop(pid)
+    return ensure_started(None, params)
+
+
+# --- this is the Ansible-specific argument parsing code ---
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            app=dict(required=True),
+            dir=dict(required=True),
+            virtualenv=dict(default=None),
+            port=dict(default='127.0.0.1:8000'),
+            state=dict(default='started', choices=['started', 'stopped', 'restarted']),
+            pidfile=dict(default='gunicorn.pid'),
+        ),
+        supports_check_mode=True
+    )
+
+    params = module.params
+    pidfile = params['pidfile']
+    state = params['state']
+
+    os.chdir(params['dir'])
+    pid = gunicorn_getpid(pidfile)
+
+    if module.check_mode:
+        # dry-run mode, don't change anything
+
+        is_running = pid is not None
+        wants_running = (state != 'stopped')
+        needs_restart = (state == 'restarted')
+
+        module.exit_json(  # arbitrary key/value pairs
+            pid=pid,
+            state=state,  # pretend the state is as requested
+            changed=needs_restart or (is_running != wants_running)  # would we change anything?
+        )
+    else:
+        # manage gunicorn for real using helper functions above
+        # catch all exceptions and report them using module.fail_json
+
+        try:
+            if state == 'started':
+                module.exit_json(**ensure_started(pid, params))
+            elif state == 'stopped':
+                module.exit_json(**ensure_stopped(pid, params))
+            elif state == 'restarted':
+                module.exit_json(**restart(pid, params))
+            else:
+                module.fail_json(msg='Invalid state parameter (Ansible should catch it though)')
+        except Exception as exc:
+            module.fail_json(msg=str(exc))
+                    
+
+# --- this line is actually quite magical but thankfully
+#     usually we don't need to care
+
+from ansible.module_utils.basic import *
+
+main()
+
+# vim: ft=python:sts=4:ts=4:sw=4:et
